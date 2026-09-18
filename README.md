@@ -794,7 +794,7 @@ options.set_capability('se:recordVideo', False)
 ```
 
 This per-session control applies to both recording modes:
-- **Event-driven mode** (`SE_VIDEO_EVENT_DRIVEN=true`, default in the Node images): the recorder subscribes to the Grid event bus and reads `se:recordVideo` from each session's capabilities on the `SessionCreated` event.
+- **Event-driven mode** (`SE_VIDEO_EVENT_DRIVEN=true`, default in the Node images): the recorder subscribes to the Grid event bus and reads `se:recordVideo` from each session's capabilities on the `SessionCreated` event. It also reconciles active sessions against the Node `/status` endpoint every `SE_VIDEO_POLL_INTERVAL` seconds so dropped lifecycle events do not silently omit or leave recordings running.
 - **Shell/polling mode** (`SE_VIDEO_EVENT_DRIVEN=false`): the recorder queries the Node `/status` endpoint (or the Hub GraphQL endpoint) based on the Node SessionId and extracts `se:recordVideo` from the capabilities before deciding whether to start recording.
 
 Notes: For the shell/polling mode to reach the GraphQL endpoint, the recorder container needs to know the Hub URL. The Hub URL can be passed via environment variable `SE_NODE_GRID_URL`. For example `SE_NODE_GRID_URL` is `http://selenium-hub:4444`.
