@@ -12,6 +12,7 @@ Subscribes to the Grid's ZeroMQ event bus and handles:
 - SessionCreatedEvent: Start video recording
 - SessionClosedEvent: Stop recording, queue upload
 - SessionEvent: Track custom events (e.g., test:failed)
+- Node /status reconciliation: Recover session lifecycle events missed by ZeroMQ
 
     Environment Variables:
     SE_EVENT_BUS_HOST: Event bus hostname (default: localhost)
@@ -66,6 +67,7 @@ class SessionClosedReason(Enum):
     TIMEOUT = "TIMEOUT"
     NODE_REMOVED = "NODE_REMOVED"
     NODE_RESTARTED = "NODE_RESTARTED"
+    UNKNOWN = "UNKNOWN"  # Reconciliation cannot determine why a session ended.
 
 
 class SessionStatus(Enum):
@@ -124,7 +126,15 @@ class SessionState:
 class VideoService:
     """Unified video recording and upload service."""
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the video service and its session reconciliation state.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         # Event bus configuration
         self.event_bus_host = os.environ.get("SE_EVENT_BUS_HOST", "localhost")
         self.event_bus_port = os.environ.get("SE_EVENT_BUS_PUBLISH_PORT", "4442")
@@ -201,9 +211,13 @@ class VideoService:
         self.se_server_protocol = os.environ.get("SE_SERVER_PROTOCOL", "http")
         default_node_port = "4444" if self.record_standalone else "5555"
         self.se_node_port = os.environ.get("SE_NODE_PORT", default_node_port)
+        self.node_status_url = f"{self.se_server_protocol}://{self.display_container}:{self.se_node_port}/status"
         self.node_status_verify_ssl = False
         self.node_poll_interval = int(os.environ.get("SE_VIDEO_POLL_INTERVAL", "2"))
         self.file_ready_max_attempts = int(os.environ.get("SE_VIDEO_FILE_READY_WAIT_ATTEMPTS", "10"))
+        self.reconcile_misses = 2
+        self.missing_status_counts: Dict[str, int] = {}
+        self.status_error_logged = False
 
         # Drain configuration
         self.max_sessions = int(os.environ.get("SE_DRAIN_AFTER_SESSION_COUNT", "0"))
@@ -216,6 +230,7 @@ class VideoService:
         # Session state management - single source of truth
         self.sessions: Dict[str, SessionState] = {}
         self.sessions_lock = asyncio.Lock()
+        self.session_lifecycle_lock = asyncio.Lock()
 
         # Upload queue - internal communication between recorder and uploader
         self.upload_queue: asyncio.Queue[UploadTask] = asyncio.Queue()
@@ -339,6 +354,204 @@ class VideoService:
         event_node_id = data.get("nodeId", "")
         return event_node_id == self.node_id
 
+    def _fetch_node_status(self) -> Optional[dict]:
+        """Fetch and decode one Node status response.
+
+        This blocking method is called through ``asyncio.to_thread`` so HTTP
+        requests never block the recorder event loop.
+
+        Args:
+            None.
+
+        Returns:
+            The decoded status payload, or ``None`` when the request fails.
+        """
+        headers: Dict[str, str] = {}
+        if self.registration_secret:
+            headers["X-REGISTRATION-SECRET"] = self.registration_secret
+        if self.router_username and self.router_password:
+            credentials = f"{self.router_username}:{self.router_password}".encode("utf-8")
+            headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode('utf-8')}"
+
+        request = Request(self.node_status_url, headers=headers)
+        ssl_context = None
+        if self.se_server_protocol.lower() == "https" and not self.node_status_verify_ssl:
+            ssl_context = ssl._create_unverified_context()
+
+        try:
+            if ssl_context is None:
+                response_context = urlopen(request, timeout=5)
+            else:
+                response_context = urlopen(request, timeout=5, context=ssl_context)
+
+            with response_context as response:
+                if response.status == 200:
+                    return json.loads(response.read().decode("utf-8"))
+        except (URLError, OSError, json.JSONDecodeError, ValueError):
+            pass
+
+        return None
+
+    def _extract_active_sessions(self, payload: dict) -> Optional[Dict[str, dict]]:
+        """Convert active Node slots into session-created event payloads.
+
+        Args:
+            payload: Decoded response from the Node ``/status`` endpoint.
+
+        Returns:
+            Active sessions keyed by session ID, or ``None`` when the response
+            does not contain authoritative Node data.
+        """
+        value = payload.get("value")
+        if not isinstance(value, dict):
+            return None
+
+        if self.record_standalone:
+            nodes = value.get("nodes")
+            if not isinstance(nodes, list) or not nodes:
+                node = value.get("node")
+                if not isinstance(node, dict):
+                    return None
+                nodes = [node]
+        else:
+            node = value.get("node")
+            if not isinstance(node, dict):
+                return None
+            nodes = [node]
+
+        active_sessions: Dict[str, dict] = {}
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+
+            node_id = node.get("id") or node.get("nodeId") or ""
+            if not self.record_standalone and self.node_id and node_id != self.node_id:
+                continue
+
+            for slot in node.get("slots", []):
+                if not isinstance(slot, dict):
+                    continue
+
+                session = slot.get("session")
+                if not isinstance(session, dict):
+                    continue
+
+                session_id = session.get("sessionId") or session.get("id")
+                if not session_id or session_id == "reserved":
+                    continue
+
+                capabilities = session.get("capabilities", {})
+                if not isinstance(capabilities, dict):
+                    capabilities = {}
+
+                active_sessions[session_id] = {
+                    "sessionId": session_id,
+                    "nodeId": node_id,
+                    "capabilities": capabilities,
+                }
+
+        return active_sessions
+
+    async def reconcile_once(self) -> bool:
+        """Reconcile tracked recordings with one successful status sample.
+
+        Sessions missing from multiple consecutive successful samples are
+        closed. Requiring confirmation prevents a status/event timing race from
+        stopping a recording that has only just started. Inferred closes retain
+        recordings because their success or failure is unknown.
+
+        Args:
+            None.
+
+        Returns:
+            ``True`` when an authoritative status payload was processed,
+            otherwise ``False``.
+        """
+        payload = await asyncio.to_thread(self._fetch_node_status)
+        if payload is None:
+            if not self.status_error_logged:
+                logger.warning(f"Session reconciliation cannot reach Node status endpoint: {self.node_status_url}")
+                self.status_error_logged = True
+            return False
+
+        active_sessions = self._extract_active_sessions(payload)
+        if active_sessions is None:
+            if not self.status_error_logged:
+                logger.warning("Session reconciliation received a status response without Node data")
+                self.status_error_logged = True
+            return False
+
+        if self.status_error_logged:
+            logger.info("Session reconciliation recovered")
+            self.status_error_logged = False
+
+        for session_id, event_data in active_sessions.items():
+            self.missing_status_counts.pop(session_id, None)
+            await self.handle_session_created(event_data)
+
+        async with self.sessions_lock:
+            open_session_ids = {
+                session_id
+                for session_id, session in self.sessions.items()
+                if session.video_file is not None and session.status != SessionStatus.CLOSED
+            }
+
+        for session_id in open_session_ids:
+            if session_id in active_sessions:
+                self.missing_status_counts.pop(session_id, None)
+                continue
+
+            missing_count = self.missing_status_counts.get(session_id, 0) + 1
+            self.missing_status_counts[session_id] = missing_count
+            if missing_count < self.reconcile_misses:
+                continue
+
+            logger.warning(
+                f"Recovering session-closed missed by the event bus after {missing_count} status checks: {session_id}"
+            )
+            await self.handle_session_closed(
+                {
+                    "sessionId": session_id,
+                    "nodeId": self.node_id or "",
+                    "reason": SessionClosedReason.UNKNOWN.value,
+                }
+            )
+
+        tracked_ids = set(open_session_ids) | set(active_sessions)
+        for session_id in list(self.missing_status_counts):
+            if session_id not in tracked_ids:
+                self.missing_status_counts.pop(session_id, None)
+
+        return True
+
+    async def reconcile_sessions(self) -> None:
+        """Continuously reconcile sessions until recorder shutdown.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        reconcile_interval = max(1, self.node_poll_interval)
+        logger.info(
+            f"Session reconciliation enabled: url={self.node_status_url}, "
+            f"interval={reconcile_interval}s, close_misses={self.reconcile_misses}"
+        )
+
+        while not self.shutdown_event.is_set():
+            try:
+                await self.reconcile_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.exception(f"Unexpected session reconciliation error: {error}")
+
+            try:
+                await asyncio.wait_for(self.shutdown_event.wait(), timeout=reconcile_interval)
+            except asyncio.TimeoutError:
+                pass
+
     async def wait_for_node_ready(self) -> None:
         """Wait for the Node /status endpoint to be reachable and resolve Node ID.
 
@@ -349,48 +562,27 @@ class VideoService:
         - Standalone (hub): $.value.nodes[0].id, $.value.nodes[0].externalUri
         - Distributed (node): $.value.node.nodeId, $.value.node.externalUri
         - Standalone sidecar on dynamic grid node: falls back to $.value.node path
+
+        Args:
+            None.
+
+        Returns:
+            None.
         """
-        node_status_url = f"{self.se_server_protocol}://{self.display_container}:{self.se_node_port}/status"
-        headers = {}
-        if self.registration_secret:
-            headers["X-REGISTRATION-SECRET"] = self.registration_secret
         if self.router_username and self.router_password:
-            auth_token = base64.b64encode(f"{self.router_username}:{self.router_password}".encode("utf-8")).decode(
-                "utf-8"
-            )
-            headers["Authorization"] = f"Basic {auth_token}"
             logger.info("Using Basic Auth for Node /status endpoint")
         elif self.router_username or self.router_password:
             logger.warning("Partial SE_ROUTER credentials provided; skipping Basic Auth for Node /status endpoint")
 
-        ssl_context = None
-        if self.se_server_protocol.lower() == "https" and not self.node_status_verify_ssl:
-            ssl_context = ssl._create_unverified_context()
-
         logger.info(
-            f"Waiting for Node /status endpoint: {node_status_url} " f"(verify_ssl={self.node_status_verify_ssl})"
+            f"Waiting for Node /status endpoint: {self.node_status_url} " f"(verify_ssl={self.node_status_verify_ssl})"
         )
-
-        def _fetch_status() -> Optional[dict]:
-            """Blocking HTTP fetch run in a thread to avoid blocking the event loop."""
-            req = Request(node_status_url, headers=headers)
-            try:
-                if ssl_context is not None:
-                    resp_ctx = urlopen(req, timeout=5, context=ssl_context)
-                else:
-                    resp_ctx = urlopen(req, timeout=5)
-                with resp_ctx as resp:
-                    if resp.status == 200:
-                        return json.loads(resp.read().decode("utf-8"))
-            except (URLError, OSError, json.JSONDecodeError, ValueError):
-                pass
-            return None
 
         while not self.shutdown_event.is_set():
             try:
                 # Run blocking urlopen in a thread so SIGTERM can be processed
                 # immediately by the event loop without waiting up to 5s.
-                body = await asyncio.to_thread(_fetch_status)
+                body = await asyncio.to_thread(self._fetch_node_status)
                 if body is not None:
                     if self.record_standalone:
                         nodes = body.get("value", {}).get("nodes", [])
@@ -415,7 +607,7 @@ class VideoService:
                     else:
                         logger.warning("Node /status responded but nodeId is missing, retrying...")
                 else:
-                    logger.debug(f"Node not ready yet: {node_status_url}")
+                    logger.debug(f"Node not ready yet: {self.node_status_url}")
             except Exception as e:
                 logger.warning(f"Unexpected error polling Node /status: {e}")
 
@@ -753,7 +945,14 @@ class VideoService:
     # ==================== Event Handlers ====================
 
     async def handle_session_created(self, data: dict) -> None:
-        """Handle session-created event."""
+        """Initialize an open session once, preserving any earlier failure events.
+
+        Args:
+            data: Session-created data from the event bus or Node status.
+
+        Returns:
+            None.
+        """
         session_id = data.get("sessionId")
         if not session_id:
             logger.warning("Received session-created without sessionId")
@@ -761,50 +960,68 @@ class VideoService:
 
         # Filter: only process sessions belonging to this Node
         if not self.is_own_node_event(data):
-            event_node_id = data.get("nodeId", "unknown")
             return
 
-        capabilities = data.get("capabilities", {})
-        record_video, video_filename = self.get_video_filename(session_id, capabilities)
+        async with self.session_lifecycle_lock:
+            async with self.sessions_lock:
+                existing_session = self.sessions.get(session_id)
+                if existing_session is not None and (
+                    existing_session.video_file is not None or existing_session.status == SessionStatus.CLOSED
+                ):
+                    logger.debug(f"Ignoring duplicate or late session-created event: {session_id}")
+                    return
 
-        if record_video and self.session_subfolder:
-            # Group each recording under its session id. If the session id is empty for any reason,
-            # fall back to the Node container/Pod name so the video still lands in a unique subfolder
-            # (important on Kubernetes where the assets volume is shared across Pods).
-            subfolder_key = session_id or os.environ.get("SE_NODE_CONTAINER_NAME", "").strip()
-            if subfolder_key:
-                session_subdir = Path(self.video_folder) / subfolder_key
-                session_subdir.mkdir(parents=True, exist_ok=True)
-                video_filename = f"{subfolder_key}/{video_filename}"
-                logger.info(f"Created session subfolder: {session_subdir}")
+            capabilities = data.get("capabilities", {})
+            if not isinstance(capabilities, dict):
+                capabilities = {}
+            record_video, video_filename = self.get_video_filename(session_id, capabilities)
 
-        retain_on_failure_cap = capabilities.get("se:retainOnFailure", None)
-        if retain_on_failure_cap is None:
-            retain_on_failure = self.retain_on_failure_enabled
-        else:
-            retain_on_failure = str(retain_on_failure_cap).lower() == "true"
+            if record_video and self.session_subfolder:
+                # Group each recording under its session id. If the session id is empty for any reason,
+                # fall back to the Node container/Pod name so the video still lands in a unique subfolder
+                # (important on Kubernetes where the assets volume is shared across Pods).
+                subfolder_key = session_id or os.environ.get("SE_NODE_CONTAINER_NAME", "").strip()
+                if subfolder_key:
+                    session_subdir = Path(self.video_folder) / subfolder_key
+                    session_subdir.mkdir(parents=True, exist_ok=True)
+                    video_filename = f"{subfolder_key}/{video_filename}"
+                    logger.info(f"Created session subfolder: {session_subdir}")
 
-        async with self.sessions_lock:
-            session = SessionState(
-                session_id=session_id,
-                capabilities=capabilities,
-                video_file=video_filename,
-                record_video=record_video,
-                retain_on_failure=retain_on_failure,
-                test_name=capabilities.get(self.test_name_cap, ""),
+            retain_on_failure_cap = capabilities.get("se:retainOnFailure", None)
+            if retain_on_failure_cap is None:
+                retain_on_failure = self.retain_on_failure_enabled
+            else:
+                retain_on_failure = str(retain_on_failure_cap).lower() == "true"
+
+            async with self.sessions_lock:
+                session = self.sessions.get(session_id)
+                if session is None:
+                    session = SessionState(session_id=session_id)
+                    self.sessions[session_id] = session
+                session.capabilities = capabilities
+                session.video_file = video_filename
+                session.record_video = record_video
+                session.retain_on_failure = retain_on_failure
+                session.test_name = capabilities.get(self.test_name_cap, "")
+
+            self.missing_status_counts.pop(session_id, None)
+            logger.info(
+                f"Session created: {session_id}, record={record_video}, "
+                f"retain_on_failure={retain_on_failure}, file={video_filename}"
             )
-            self.sessions[session_id] = session
 
-        logger.info(
-            f"Session created: {session_id}, record={record_video}, "
-            f"retain_on_failure={retain_on_failure}, file={video_filename}"
-        )
-
-        if record_video:
-            await self.start_recording(session)
+            if record_video:
+                await self.start_recording(session)
 
     async def handle_session_closed(self, data: dict) -> None:
-        """Handle session-closed event."""
+        """Close a session once and remember recent closes even if creation was missed.
+
+        Args:
+            data: Session-closed data from the event bus or Node status.
+
+        Returns:
+            None.
+        """
         session_id = data.get("sessionId")
         if not session_id:
             logger.warning("Received session-closed without sessionId")
@@ -812,55 +1029,64 @@ class VideoService:
 
         # Filter: only process sessions belonging to this Node
         if not self.is_own_node_event(data):
-            event_node_id = data.get("nodeId", "unknown")
             return
 
-        reason_str = data.get("reason", "QUIT_COMMAND")
-        try:
-            reason = SessionClosedReason(reason_str)
-        except ValueError:
-            reason = SessionClosedReason.QUIT_COMMAND
+        async with self.session_lifecycle_lock:
+            reason_str = data.get("reason", "QUIT_COMMAND")
+            try:
+                reason = SessionClosedReason(reason_str)
+            except ValueError:
+                reason = SessionClosedReason.QUIT_COMMAND
 
-        async with self.sessions_lock:
-            session = self.sessions.get(session_id)
-            if session is None:
-                logger.warning(f"Session-closed for unknown session: {session_id}")
-                return
+            async with self.sessions_lock:
+                session = self.sessions.get(session_id)
+                if session is None:
+                    logger.warning(f"Session-closed for unknown session: {session_id}")
+                    # Keep a closed placeholder until normal delayed cleanup so
+                    # an older status response or late create cannot restart it.
+                    session = SessionState(session_id=session_id)
+                    self.sessions[session_id] = session
+                if session.status == SessionStatus.CLOSED:
+                    logger.debug(f"Ignoring duplicate session-closed event: {session_id}")
+                    return
 
-            session.close_reason = reason
-            session.status = SessionStatus.CLOSED
+                session.close_reason = reason
+                session.status = SessionStatus.CLOSED
 
-        logger.info(f"Session closed: {session_id}, reason={reason.value}, is_failed={session.is_failed}")
+            self.missing_status_counts.pop(session_id, None)
+            logger.info(f"Session closed: {session_id}, reason={reason.value}, is_failed={session.is_failed}")
 
-        # Stop recording if in progress
-        if session.ffmpeg_process is not None:
-            stopped = await self.stop_recording(session)
-            if stopped:
-                discard = session.retain_on_failure and not session.is_failed
-                if discard:
-                    if session.video_file:
-                        video_path = Path(self.video_folder) / session.video_file
-                        if video_path.exists():
-                            try:
-                                video_path.unlink()
-                                logger.info(f"Video discarded for successful session {session_id} (retain-on-failure)")
-                            except Exception as exc:
-                                logger.warning(f"Failed to delete video file {video_path}: {exc}")
+            # Stop recording if in progress
+            if session.ffmpeg_process is not None:
+                stopped = await self.stop_recording(session)
+                if stopped:
+                    discard = session.retain_on_failure and not session.is_failed
+                    if discard:
+                        if session.video_file:
+                            video_path = Path(self.video_folder) / session.video_file
+                            if video_path.exists():
+                                try:
+                                    video_path.unlink()
+                                    logger.info(
+                                        f"Video discarded for successful session {session_id} (retain-on-failure)"
+                                    )
+                                except Exception as exc:
+                                    logger.warning(f"Failed to delete video file {video_path}: {exc}")
+                    else:
+                        await self.queue_upload(session)
                 else:
-                    await self.queue_upload(session)
-            else:
-                logger.warning(f"Recording stop failed for {session_id}, skipping upload")
+                    logger.warning(f"Recording stop failed for {session_id}, skipping upload")
 
-        # Clean up session after a delay (keep for potential late events).
-        # Tracked so cleanup() can cancel these on shutdown instead of waiting 60s.
-        t = asyncio.create_task(self._cleanup_session_delayed(session_id, delay=60))
-        self._cleanup_tasks.append(t)
-        t.add_done_callback(lambda fut: self._cleanup_tasks.remove(fut) if fut in self._cleanup_tasks else None)
+            # Clean up session after a delay (keep for potential late events).
+            # Tracked so cleanup() can cancel these on shutdown instead of waiting 60s.
+            t = asyncio.create_task(self._cleanup_session_delayed(session_id, delay=60))
+            self._cleanup_tasks.append(t)
+            t.add_done_callback(lambda fut: self._cleanup_tasks.remove(fut) if fut in self._cleanup_tasks else None)
 
-        # Check drain condition
-        if self.max_sessions > 0 and self.recorded_count >= self.max_sessions:
-            logger.info(f"Max sessions reached ({self.max_sessions}), initiating shutdown")
-            self.shutdown_event.set()
+            # Check drain condition
+            if self.max_sessions > 0 and self.recorded_count >= self.max_sessions:
+                logger.info(f"Max sessions reached ({self.max_sessions}), initiating shutdown")
+                self.shutdown_event.set()
 
     async def handle_session_event(self, data: dict) -> None:
         """Handle custom session-event."""
@@ -904,7 +1130,17 @@ class VideoService:
     # ==================== Event Bus ====================
 
     async def subscribe_events(self) -> None:
-        """Subscribe to event bus and process events."""
+        """Process event-bus messages while reconciling Node session status.
+
+        On exit, signal shutdown and let the current reconciliation finish
+        finalizing recordings and queuing uploads before cleanup can run.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
         self.context = zmq.asyncio.Context()
         self.subscriber = self.context.socket(zmq.SUB)
         self.subscriber.setsockopt(zmq.LINGER, 0)
@@ -948,6 +1184,7 @@ class VideoService:
         }
 
         logger.info(f"Subscribed to events: {list(handlers.keys())}")
+        reconcile_task = asyncio.create_task(self.reconcile_sessions(), name="session_reconciler")
 
         try:
             while not self.shutdown_event.is_set():
@@ -998,6 +1235,11 @@ class VideoService:
                     await asyncio.sleep(1)
 
         finally:
+            # stop_recording() clears the process reference before awaiting
+            # FFmpeg. Cancelling it here would prevent cleanup() from resuming
+            # finalization, so let the in-flight reconciliation finish instead.
+            self.shutdown_event.set()
+            await asyncio.gather(reconcile_task, return_exceptions=True)
             self.recorder_done.set()
             if self.subscriber:
                 self.subscriber.close()
