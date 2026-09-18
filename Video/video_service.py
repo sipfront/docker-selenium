@@ -1154,6 +1154,9 @@ class VideoService:
     async def subscribe_events(self) -> None:
         """Process event-bus messages while reconciling Node session status.
 
+        On exit, signal shutdown and let the current reconciliation finish
+        finalizing recordings and queuing uploads before cleanup can run.
+
         Args:
             None.
 
@@ -1254,7 +1257,10 @@ class VideoService:
                     await asyncio.sleep(1)
 
         finally:
-            reconcile_task.cancel()
+            # stop_recording() clears the process reference before awaiting
+            # FFmpeg. Cancelling it here would prevent cleanup() from resuming
+            # finalization, so let the in-flight reconciliation finish instead.
+            self.shutdown_event.set()
             await asyncio.gather(reconcile_task, return_exceptions=True)
             self.recorder_done.set()
             if self.subscriber:

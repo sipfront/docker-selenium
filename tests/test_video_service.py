@@ -1,12 +1,13 @@
 """Unit tests for the event-driven Selenium video service."""
 
+import asyncio
 import importlib.util
 import os
 import sys
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 
 def load_video_service_module():
@@ -150,6 +151,137 @@ class VideoServiceReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.service.reconcile_once())
         self.assertEqual(self.service.sessions["session-1"].status, video_service.SessionStatus.CREATED)
         self.assertEqual(self.service.missing_status_counts, {})
+
+    async def test_shutdown_finishes_reconciled_recording_before_cleanup(self) -> None:
+        """Finish FFmpeg and queue its video before shutdown cleanup runs.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        stop_started = asyncio.Event()
+        finish_stop = asyncio.Event()
+        poll_finished = asyncio.Event()
+
+        async def drain() -> None:
+            """Pause finalization after the session's process reference is cleared.
+
+            Args:
+                None.
+
+            Returns:
+                None.
+            """
+            stop_started.set()
+            await finish_stop.wait()
+
+        async def poll(timeout: int) -> bool:
+            """Wake the subscriber when shutdown is requested during finalization.
+
+            Args:
+                timeout: Socket polling timeout in milliseconds, unused by this fake.
+
+            Returns:
+                False because no event-bus message is available.
+            """
+            await self.service.shutdown_event.wait()
+            poll_finished.set()
+            return False
+
+        process = Mock()
+        process.stdin.is_closing.return_value = False
+        process.stdin.drain = AsyncMock(side_effect=drain)
+        process.communicate = AsyncMock(return_value=(b"", b""))
+        process.returncode = 0
+        session = video_service.SessionState(
+            session_id="session-1",
+            status=video_service.SessionStatus.RECORDING,
+            video_file="session-1.mp4",
+            ffmpeg_process=process,
+        )
+        self.service.sessions[session.session_id] = session
+        self.service.missing_status_counts[session.session_id] = 1
+        self.service._fetch_node_status = Mock(return_value=self.status_payload())
+        self.service.upload_enabled = True
+        self.service.upload_destination = "test:videos"
+
+        subscriber = Mock(poll=AsyncMock(side_effect=poll))
+        context = Mock()
+        context.socket.return_value = subscriber
+        with patch.multiple(
+            video_service.zmq, SUB=1, LINGER=2, SUBSCRIBE=3, ZMQError=OSError, create=True
+        ), patch.object(video_service.zmq.asyncio, "Context", return_value=context), patch.object(
+            video_service.Path, "exists", return_value=True
+        ), patch.object(
+            self.service, "wait_for_file_integrity", new_callable=AsyncMock, return_value=True
+        ) as integrity_check:
+            subscriber_task = asyncio.create_task(self.service.subscribe_events())
+            try:
+                await asyncio.wait_for(stop_started.wait(), timeout=2)
+                self.assertIsNone(session.ffmpeg_process)
+                self.service.shutdown_event.set()
+                await asyncio.wait_for(poll_finished.wait(), timeout=2)
+                self.assertFalse(self.service.recorder_done.is_set())
+            finally:
+                finish_stop.set()
+                self.service.shutdown_event.set()
+                await asyncio.wait_for(subscriber_task, timeout=2)
+
+            process.communicate.assert_awaited_once()
+            integrity_check.assert_awaited_once()
+            self.assertEqual(self.service.recorded_count, 1)
+            self.assertTrue(self.service.recorder_done.is_set())
+            await self.service.cleanup()
+
+        upload = self.service.upload_queue.get_nowait()
+        self.assertEqual(upload.session_id, session.session_id)
+        self.assertEqual(upload.destination, "test:videos")
+        self.assertIsNone(self.service.upload_queue.get_nowait())
+        self.assertTrue(self.service.upload_queue.empty())
+        subscriber.close.assert_called_once()
+        context.term.assert_called_once()
+
+    async def test_subscriber_failure_signals_reconciler_shutdown(self) -> None:
+        """Stop an idle reconciler when the subscriber exits unexpectedly.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        reconcile_started = asyncio.Event()
+        self.service.node_poll_interval = 3600
+        self.service.reconcile_once = AsyncMock(side_effect=reconcile_started.set)
+
+        async def poll(timeout: int) -> bool:
+            """Fail the subscriber after its reconciliation task has started.
+
+            Args:
+                timeout: Socket polling timeout in milliseconds, unused by this fake.
+
+            Returns:
+                Never returns; raises a simulated subscriber failure.
+            """
+            await reconcile_started.wait()
+            raise RuntimeError("subscriber failed")
+
+        subscriber = Mock(poll=AsyncMock(side_effect=poll))
+        context = Mock()
+        context.socket.return_value = subscriber
+        with patch.multiple(
+            video_service.zmq, SUB=1, LINGER=2, SUBSCRIBE=3, ZMQError=OSError, create=True
+        ), patch.object(video_service.zmq.asyncio, "Context", return_value=context):
+            with self.assertRaisesRegex(RuntimeError, "subscriber failed"):
+                await asyncio.wait_for(self.service.subscribe_events(), timeout=2)
+
+        self.assertTrue(self.service.shutdown_event.is_set())
+        self.assertTrue(self.service.recorder_done.is_set())
+        self.service.reconcile_once.assert_awaited_once()
+        subscriber.close.assert_called_once()
+        context.term.assert_called_once()
 
     async def test_duplicate_close_event_is_idempotent(self) -> None:
         """Schedule session cleanup only once when close is repeated.
