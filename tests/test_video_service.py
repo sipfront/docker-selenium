@@ -63,6 +63,14 @@ class VideoServiceReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.environment.start()
         self.service = video_service.VideoService()
         self.service.node_id = "node-1"
+        self.context = Mock()
+        self.subscriber = self.context.socket.return_value
+        for patcher in (
+            patch.multiple(video_service.zmq, SUB=1, LINGER=2, SUBSCRIBE=3, ZMQError=OSError, create=True),
+            patch.object(video_service.zmq.asyncio, "Context", return_value=self.context),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     async def asyncTearDown(self) -> None:
         """Cancel delayed cleanup tasks and restore the test environment.
@@ -89,16 +97,8 @@ class VideoServiceReconciliationTests(unittest.IsolatedAsyncioTestCase):
         Returns:
             A decoded Selenium Node status response.
         """
-        return {
-            "value": {
-                "nodes": [
-                    {
-                        "id": "node-1",
-                        "slots": [{"session": session} for session in sessions],
-                    }
-                ]
-            }
-        }
+        node = {"id": "node-1", "slots": [{"session": session} for session in sessions]}
+        return {"value": {"nodes": [node]}}
 
     async def test_reconciliation_recovers_missed_create_and_close_events(self) -> None:
         """Recover a session after create and close events are both missed.
@@ -151,6 +151,124 @@ class VideoServiceReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.service.reconcile_once())
         self.assertEqual(self.service.sessions["session-1"].status, video_service.SessionStatus.CREATED)
         self.assertEqual(self.service.missing_status_counts, {})
+
+    async def test_retain_on_failure_requires_confirmed_success_to_discard(self) -> None:
+        """Retain inferred closes while still discarding confirmed successful quits.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        for reconciled in (True, False):
+            with self.subTest(reconciled=reconciled):
+                session = video_service.SessionState(
+                    session_id="session-1",
+                    video_file="session-1.mp4",
+                    ffmpeg_process=Mock(),
+                    retain_on_failure=True,
+                )
+                self.service.sessions[session.session_id] = session
+                self.service._fetch_node_status = Mock(return_value=self.status_payload())
+                with patch.object(self.service, "stop_recording", return_value=True), patch.object(
+                    self.service, "queue_upload"
+                ) as upload, patch.object(video_service.Path, "exists", return_value=True), patch.object(
+                    video_service.Path, "unlink"
+                ) as unlink:
+                    if reconciled:
+                        await self.service.reconcile_once()
+                        await self.service.reconcile_once()
+                        await self.service.handle_session_closed(
+                            {"sessionId": session.session_id, "reason": "TIMEOUT"}
+                        )
+                        unlink.assert_not_called()
+                        upload.assert_awaited_once_with(session)
+                        self.assertNotEqual(session.close_reason, video_service.SessionClosedReason.QUIT_COMMAND)
+                    else:
+                        await self.service.handle_session_closed(
+                            {"sessionId": session.session_id, "reason": "QUIT_COMMAND"}
+                        )
+                        unlink.assert_called_once()
+                        upload.assert_not_awaited()
+
+    async def test_reconciliation_preserves_failure_events_on_placeholder(self) -> None:
+        """Initialize a recovered session without losing an earlier failure event.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        await self.service.handle_session_event({"sessionId": "session-1", "eventType": "test:failed"})
+        placeholder = self.service.sessions["session-1"]
+        capabilities = {"se:name": "recovered-session", "se:recordVideo": True, "se:retainOnFailure": True}
+        self.service._fetch_node_status = Mock(
+            return_value=self.status_payload({"sessionId": "session-1", "capabilities": capabilities})
+        )
+
+        with patch.object(self.service, "start_recording") as start:
+            await self.service.reconcile_once()
+
+        session = self.service.sessions["session-1"]
+        self.assertIs(session, placeholder)
+        self.assertTrue(session.is_failed)
+        self.assertEqual(session.failure_events, ["test:failed"])
+        self.assertEqual(session.capabilities, capabilities)
+        self.assertEqual(session.video_file, "recovered-session.mp4")
+        self.assertTrue(session.retain_on_failure)
+        start.assert_awaited_once_with(session)
+
+    async def test_delayed_status_does_not_restart_a_closed_session(self) -> None:
+        """Ignore stale status and create events after a close, even without a recording.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+        """
+        for with_placeholder in (False, True):
+            with self.subTest(with_placeholder=with_placeholder):
+                session_id = f"session-{with_placeholder}"
+                if with_placeholder:
+                    await self.service.handle_session_event({"sessionId": session_id, "eventType": "test:failed"})
+                create_event = {"sessionId": session_id, "capabilities": {"se:recordVideo": True}}
+                self.service._fetch_node_status = Mock(return_value=self.status_payload(create_event))
+                status_sampled = asyncio.Event()
+                release_status = asyncio.Event()
+
+                async def delayed_status(fetch):
+                    """Hold a sampled response until the session closes.
+
+                    Args:
+                        fetch: Callable returning the sampled Node status payload.
+
+                    Returns:
+                        The status payload captured before the close event.
+                    """
+                    payload = fetch()
+                    status_sampled.set()
+                    await release_status.wait()
+                    return payload
+
+                with patch.object(video_service.asyncio, "to_thread", side_effect=delayed_status), patch.object(
+                    self.service, "start_recording"
+                ) as start:
+                    reconcile_task = asyncio.create_task(self.service.reconcile_once())
+                    try:
+                        await asyncio.wait_for(status_sampled.wait(), timeout=2)
+                        await self.service.handle_session_closed({"sessionId": session_id, "reason": "QUIT_COMMAND"})
+                    finally:
+                        release_status.set()
+                        await asyncio.wait_for(reconcile_task, timeout=2)
+
+                    # A queued create handler must also re-check the closed state under its lifecycle lock.
+                    await self.service.handle_session_created(create_event)
+                    start.assert_not_awaited()
+                    self.assertEqual(self.service.sessions[session_id].status, video_service.SessionStatus.CLOSED)
+                    self.assertIsNone(self.service.sessions[session_id].video_file)
 
     async def test_shutdown_finishes_reconciled_recording_before_cleanup(self) -> None:
         """Finish FFmpeg and queue its video before shutdown cleanup runs.
@@ -207,14 +325,8 @@ class VideoServiceReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.service.upload_enabled = True
         self.service.upload_destination = "test:videos"
 
-        subscriber = Mock(poll=AsyncMock(side_effect=poll))
-        context = Mock()
-        context.socket.return_value = subscriber
-        with patch.multiple(
-            video_service.zmq, SUB=1, LINGER=2, SUBSCRIBE=3, ZMQError=OSError, create=True
-        ), patch.object(video_service.zmq.asyncio, "Context", return_value=context), patch.object(
-            video_service.Path, "exists", return_value=True
-        ), patch.object(
+        self.subscriber.poll = AsyncMock(side_effect=poll)
+        with patch.object(video_service.Path, "exists", return_value=True), patch.object(
             self.service, "wait_for_file_integrity", new_callable=AsyncMock, return_value=True
         ) as integrity_check:
             subscriber_task = asyncio.create_task(self.service.subscribe_events())
@@ -240,8 +352,8 @@ class VideoServiceReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upload.destination, "test:videos")
         self.assertIsNone(self.service.upload_queue.get_nowait())
         self.assertTrue(self.service.upload_queue.empty())
-        subscriber.close.assert_called_once()
-        context.term.assert_called_once()
+        self.subscriber.close.assert_called_once()
+        self.context.term.assert_called_once()
 
     async def test_subscriber_failure_signals_reconciler_shutdown(self) -> None:
         """Stop an idle reconciler when the subscriber exits unexpectedly.
@@ -268,20 +380,15 @@ class VideoServiceReconciliationTests(unittest.IsolatedAsyncioTestCase):
             await reconcile_started.wait()
             raise RuntimeError("subscriber failed")
 
-        subscriber = Mock(poll=AsyncMock(side_effect=poll))
-        context = Mock()
-        context.socket.return_value = subscriber
-        with patch.multiple(
-            video_service.zmq, SUB=1, LINGER=2, SUBSCRIBE=3, ZMQError=OSError, create=True
-        ), patch.object(video_service.zmq.asyncio, "Context", return_value=context):
-            with self.assertRaisesRegex(RuntimeError, "subscriber failed"):
-                await asyncio.wait_for(self.service.subscribe_events(), timeout=2)
+        self.subscriber.poll = AsyncMock(side_effect=poll)
+        with self.assertRaisesRegex(RuntimeError, "subscriber failed"):
+            await asyncio.wait_for(self.service.subscribe_events(), timeout=2)
 
         self.assertTrue(self.service.shutdown_event.is_set())
         self.assertTrue(self.service.recorder_done.is_set())
         self.service.reconcile_once.assert_awaited_once()
-        subscriber.close.assert_called_once()
-        context.term.assert_called_once()
+        self.subscriber.close.assert_called_once()
+        self.context.term.assert_called_once()
 
     async def test_duplicate_close_event_is_idempotent(self) -> None:
         """Schedule session cleanup only once when close is repeated.

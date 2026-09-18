@@ -67,6 +67,7 @@ class SessionClosedReason(Enum):
     TIMEOUT = "TIMEOUT"
     NODE_REMOVED = "NODE_REMOVED"
     NODE_RESTARTED = "NODE_RESTARTED"
+    UNKNOWN = "UNKNOWN"  # Reconciliation cannot determine why a session ended.
 
 
 class SessionStatus(Enum):
@@ -210,6 +211,7 @@ class VideoService:
         self.se_server_protocol = os.environ.get("SE_SERVER_PROTOCOL", "http")
         default_node_port = "4444" if self.record_standalone else "5555"
         self.se_node_port = os.environ.get("SE_NODE_PORT", default_node_port)
+        self.node_status_url = f"{self.se_server_protocol}://{self.display_container}:{self.se_node_port}/status"
         self.node_status_verify_ssl = False
         self.node_poll_interval = int(os.environ.get("SE_VIDEO_POLL_INTERVAL", "2"))
         self.file_ready_max_attempts = int(os.environ.get("SE_VIDEO_FILE_READY_WAIT_ATTEMPTS", "10"))
@@ -352,37 +354,6 @@ class VideoService:
         event_node_id = data.get("nodeId", "")
         return event_node_id == self.node_id
 
-    @property
-    def node_status_url(self) -> str:
-        """Build the configured Node status endpoint URL.
-
-        Args:
-            None.
-
-        Returns:
-            The absolute Node ``/status`` endpoint URL.
-        """
-        return f"{self.se_server_protocol}://{self.display_container}:{self.se_node_port}/status"
-
-    def _status_headers(self) -> Dict[str, str]:
-        """Build authentication headers for the Node status endpoint.
-
-        Args:
-            None.
-
-        Returns:
-            A dictionary containing configured Node authentication headers.
-        """
-        headers: Dict[str, str] = {}
-        if self.registration_secret:
-            headers["X-REGISTRATION-SECRET"] = self.registration_secret
-
-        if self.router_username and self.router_password:
-            credentials = f"{self.router_username}:{self.router_password}".encode("utf-8")
-            headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode('utf-8')}"
-
-        return headers
-
     def _fetch_node_status(self) -> Optional[dict]:
         """Fetch and decode one Node status response.
 
@@ -395,7 +366,14 @@ class VideoService:
         Returns:
             The decoded status payload, or ``None`` when the request fails.
         """
-        request = Request(self.node_status_url, headers=self._status_headers())
+        headers: Dict[str, str] = {}
+        if self.registration_secret:
+            headers["X-REGISTRATION-SECRET"] = self.registration_secret
+        if self.router_username and self.router_password:
+            credentials = f"{self.router_username}:{self.router_password}".encode("utf-8")
+            headers["Authorization"] = f"Basic {base64.b64encode(credentials).decode('utf-8')}"
+
+        request = Request(self.node_status_url, headers=headers)
         ssl_context = None
         if self.se_server_protocol.lower() == "https" and not self.node_status_verify_ssl:
             ssl_context = ssl._create_unverified_context()
@@ -479,7 +457,8 @@ class VideoService:
 
         Sessions missing from multiple consecutive successful samples are
         closed. Requiring confirmation prevents a status/event timing race from
-        stopping a recording that has only just started.
+        stopping a recording that has only just started. Inferred closes retain
+        recordings because their success or failure is unknown.
 
         Args:
             None.
@@ -507,14 +486,8 @@ class VideoService:
             self.status_error_logged = False
 
         for session_id, event_data in active_sessions.items():
-            async with self.sessions_lock:
-                tracked_session = self.sessions.get(session_id)
-                needs_initialization = tracked_session is None or tracked_session.video_file is None
-
             self.missing_status_counts.pop(session_id, None)
-            if needs_initialization:
-                logger.warning(f"Recovering session-created missed by the event bus: {session_id}")
-                await self.handle_session_created(event_data)
+            await self.handle_session_created(event_data)
 
         async with self.sessions_lock:
             open_session_ids = {
@@ -540,7 +513,7 @@ class VideoService:
                 {
                     "sessionId": session_id,
                     "nodeId": self.node_id or "",
-                    "reason": SessionClosedReason.QUIT_COMMAND.value,
+                    "reason": SessionClosedReason.UNKNOWN.value,
                 }
             )
 
@@ -972,7 +945,7 @@ class VideoService:
     # ==================== Event Handlers ====================
 
     async def handle_session_created(self, data: dict) -> None:
-        """Create recording state once for an observed session.
+        """Initialize an open session once, preserving any earlier failure events.
 
         Args:
             data: Session-created data from the event bus or Node status.
@@ -992,8 +965,10 @@ class VideoService:
         async with self.session_lifecycle_lock:
             async with self.sessions_lock:
                 existing_session = self.sessions.get(session_id)
-                if existing_session is not None and existing_session.video_file is not None:
-                    logger.debug(f"Ignoring duplicate session-created event: {session_id}")
+                if existing_session is not None and (
+                    existing_session.video_file is not None or existing_session.status == SessionStatus.CLOSED
+                ):
+                    logger.debug(f"Ignoring duplicate or late session-created event: {session_id}")
                     return
 
             capabilities = data.get("capabilities", {})
@@ -1019,15 +994,15 @@ class VideoService:
                 retain_on_failure = str(retain_on_failure_cap).lower() == "true"
 
             async with self.sessions_lock:
-                session = SessionState(
-                    session_id=session_id,
-                    capabilities=capabilities,
-                    video_file=video_filename,
-                    record_video=record_video,
-                    retain_on_failure=retain_on_failure,
-                    test_name=capabilities.get(self.test_name_cap, ""),
-                )
-                self.sessions[session_id] = session
+                session = self.sessions.get(session_id)
+                if session is None:
+                    session = SessionState(session_id=session_id)
+                    self.sessions[session_id] = session
+                session.capabilities = capabilities
+                session.video_file = video_filename
+                session.record_video = record_video
+                session.retain_on_failure = retain_on_failure
+                session.test_name = capabilities.get(self.test_name_cap, "")
 
             self.missing_status_counts.pop(session_id, None)
             logger.info(
@@ -1039,7 +1014,7 @@ class VideoService:
                 await self.start_recording(session)
 
     async def handle_session_closed(self, data: dict) -> None:
-        """Close recording state once for an observed session.
+        """Close a session once and remember recent closes even if creation was missed.
 
         Args:
             data: Session-closed data from the event bus or Node status.
@@ -1067,7 +1042,10 @@ class VideoService:
                 session = self.sessions.get(session_id)
                 if session is None:
                     logger.warning(f"Session-closed for unknown session: {session_id}")
-                    return
+                    # Keep a closed placeholder until normal delayed cleanup so
+                    # an older status response or late create cannot restart it.
+                    session = SessionState(session_id=session_id)
+                    self.sessions[session_id] = session
                 if session.status == SessionStatus.CLOSED:
                     logger.debug(f"Ignoring duplicate session-closed event: {session_id}")
                     return
